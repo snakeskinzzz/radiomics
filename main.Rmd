@@ -1,0 +1,377 @@
+---
+title: "胶质瘤影像组学"
+author: "吖查"
+date: "`r Sys.Date()`"
+output:
+  html_document: null
+  word_document: default
+  toc: true
+  pdf_document: default
+---
+
+## 项目介绍
+这个项目主要是复现《Development and validation of an MRI-based radiomics nomogram for distinguishing Warthin's tumour from pleomorphic adenomas of the parotid gland》这篇影像组学论文中的方法。
+
+这篇论文方法如下：
+
+1.对临床特征进行建模
+
+2.提取影像组学特征，通过LassoCv进行特征筛选再建模
+
+3.结合影像组学特征+age临床特征进行建模
+
+4.得到影像组学特征+age临床特征的模型最好
+
+5.绘制三个模型的ROC曲线进行对比
+
+6.绘制诺模图+决策曲线+校准曲线
+
+而这个项目采用是胶质瘤的公开数据，结合年龄。采用论文的方法进行搭建。写下这个项目的目地是能带给医学专业的朋友一点帮助，毕竟学医对代码不是太友好。希望这个项目的代码可以稍微帮助到他们，可以把时间更多花在疾病分析，而不是解决某个bug花大量的时间。
+
+## 数据介绍
+
+BraTS2019 数据集是胶质瘤脑肿瘤分割比赛数据集，HGG是高级别胶质瘤，LGG是低级别胶质瘤。每个病例都有四个MR模态。分别是T1、T2、Flair、T1增强。原始的数据是带有Hgg患者的年龄数据的（去掉年龄缺失的病例)。但是Lgg的患者是没有的。为了不影响临床+影像组学的建模。在（25到55）之间随机生成一个随机数赋予个Lgg患者作为他的年龄。所以Lgg患者的年龄是虚拟数据。
+
+## 提取特征
+
+通过pyradiomics库提取胶质瘤影像组学特征
+
+1.因为这个braTs数据集是用作分割任务的。现在我用来做影像组学。我只用到里面的T1增强和Seg两个数据。这个项目目的是分类HGG和LGG
+
+2.Seg.nii数据里面分了标签0、1、2、4。0是背景，其他是胶质瘤病灶区。我要把1、2、4标签都变成1，重新制作Mask文件。
+
+3.第2步我已经处理好了，已经生成新的数据
+```{r}
+options(reticulate.conda_binary = "/Users/headsnakeyu/Documents/anaconda3/condabin/conda")
+library(reticulate)
+use_condaenv("radio311", required = TRUE)
+```
+
+```{python}
+#导入相关的库
+import sys
+import pandas as pd
+import os
+import random
+import shutil
+import numpy as np
+import radiomics
+from radiomics import featureextractor
+import SimpleITK as sitk  
+```
+
+### 通过pyradiomics提取影像组学特征
+
+这里运行时间有点长，可以去喝杯咖啡(是好几杯咖啡。。。几个小时) 如果觉得太久可以不用运行，已经生成了对应的Hgg.csv和Lgg.csv文件，在csv文件夹中。
+
+```{python}
+kinds = ['TUMOR','HEALTHY']
+#这个是特征处理配置文件，具体可以参考pyradiomics官网
+para_path = 'yaml/MR_1mm.yaml'
+
+extractor = featureextractor.RadiomicsFeatureExtractor(para_path) 
+dir = 'data/MyData/'
+
+for kind in kinds:
+    print("{}:开始提取特征".format(kind))
+    df = pd.DataFrame()
+    path =  dir + kind
+    # 使用配置文件初始化特征抽取器
+    for index, folder in enumerate(os.listdir(path)):
+        if folder == '.DS_Store':
+           continue
+        ori_path = os.path.join(path, folder, 'phiMap.nii')
+        file_name = folder[:-4] if folder[-3:]=='ROI' else folder
+        lab_path = os.path.join(path, folder, file_name + '.nii.gz')
+        # for f in os.listdir(os.path.join(path, folder)):
+        #     if 't1ce' in f:
+        #         ori_path = os.path.join(path,folder, f)
+        #         break
+        # lab_path = ori_path.replace('t1ce','seg')
+        features = extractor.execute(ori_path,lab_path)  #抽取特征
+        #新增一列用来保存病例文件夹名字
+        features = {'index': file_name, **features}
+        df_add = pd.DataFrame.from_dict(features.values()).T
+        df_add.columns = features.keys()
+        df = pd.concat([df, df_add])
+    df.to_csv('csv/' +'{}.csv'.format(kind),index=0)
+    print('Done')
+print("完成")
+```
+
+### 对提取出来的csv文件进一步处理，
+
+删除字符串的特征，并增加lable标记，LGG为0，HGG为1。然后合并生成total文件然后通过R语言进行分析和建模。
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.utils import shuffle
+
+tumor_data = pd.read_csv('csv/TUMOR.csv')
+healthy_data = pd.read_csv('csv/HEALTHY.csv')
+
+tumor_data.insert(1,'label', 1) #插入标签
+healthy_data.insert(1,'label', 0) #插入标签
+
+#因为有些特征是字符串，直接删掉
+cols=[x for i,x in enumerate(tumor_data.columns) if type(tumor_data.iat[1,i]) == str]
+cols.remove('index')
+tumor_data=tumor_data.drop(cols,axis=1)
+cols=[x for i,x in enumerate(healthy_data.columns) if type(healthy_data.iat[1,i]) == str]
+cols.remove('index')
+healthy_data=healthy_data.drop(cols,axis=1)
+
+#再合并成一个新的csv文件。
+total_data = pd.concat([tumor_data, healthy_data])
+total_data = shuffle(total_data)
+total_data.to_csv('csv/TotalOMICS.csv',index=False)
+
+#简单查看数据的分布
+fig, ax = plt.subplots()
+sns.set()
+ax = sns.countplot(x='label',hue='label',data=total_data)
+plt.show()
+print(total_data['label'].value_counts())
+```
+
+## 划分数据
+
+```{r}
+#导入常用R包
+library(glmnet)
+library(rms)
+library(foreign)
+library(ggplot2)
+library(pROC)
+#设置种子为了保证每次结果都一样
+set.seed(888)
+```
+
+### 8:2划分训练集和测试集
+
+```{r}
+data <- read.csv("csv/TotalOMICS.csv")
+nn=0.7
+print(paste('总样本数:',length(data[,1])))
+
+sub<-sample(1:nrow(data),round(nrow(data)*nn))
+trainOmics<-data[sub,]#取0.8的数据做训练集
+testOmics<-data[-sub,]#取0.2的数据做测试集
+print(paste('训练集样本数:',length(trainOmics[,1])))
+print(paste('测试集样本数:',length(testOmics[,1])))
+write.csv(trainOmics,"csv/trainOmics.csv",row.names = FALSE )
+write.csv(testOmics,"csv/testOmics.csv",row.names = FALSE )
+```
+
+
+
+
+## 对单纯影像组学建模
+先做T检验，再做Lasso回归进行对特征筛选，再逻辑回归建模
+
+```{python}
+#T检验
+from scipy.stats import levene, ttest_ind
+tData = pd.read_csv('./csv/trainOmics.csv')
+classinformation = tData["label"].unique()
+for temp_classinformation in classinformation:
+  temp_data = tData[tData['label'].isin([temp_classinformation])]
+  exec("df%s=temp_data"%temp_classinformation)
+
+columns_index =[]
+for column_name in tData.columns[2:]:
+    if levene(df1[column_name], df0[column_name])[1] > 0.05:
+        if ttest_ind(df1[column_name],df0[column_name],equal_var=True)[1] < 0.05:
+            columns_index.append(column_name)
+    else:
+        if ttest_ind(df1[column_name],df0[column_name],equal_var=False)[1] < 0.05:
+            columns_index.append(column_name)
+
+print("T检验筛选后剩下的特征数：{}个".format(len(columns_index)))
+
+#数据只保留从T检验筛选出的特征数据，重新组合成data
+
+if  not 'label' in columns_index:
+    columns_index = ['label'] + columns_index
+if not 'index' in columns_index:
+    columns_index = ['index'] + columns_index
+df1 = df1[columns_index]  
+df0 = df0[columns_index]  
+
+tData = pd.concat([df1, df0])
+tData.to_csv('./csv/tData_train.csv',header=True,index=False,encoding="utf_8_sig")
+```
+
+### 加载通过T检验后的数据进行lasso特征筛选
+
+```{r}
+tData_train <- read.csv("csv/tData_train.csv",fileEncoding = "UTF-8-BOM")
+dim(tData_train)
+Y <-as.data.frame(tData_train$label)
+#[,-1]是为了去掉截距
+Y <- model.matrix(~.,data=Y)[,-1]
+#除去因变量，提取自变量
+yavars<-names(tData_train) %in% c("label","index")
+X <- as.data.frame(tData_train[!yavars])
+X <- model.matrix(~.,data=X)[,-1]
+#Lasso回归
+fit <- glmnet(X,Y, alpha=1, family = "binomial")
+plot(fit, xvar="lambda", label=TRUE)
+```
+
+```{r}
+cv.fit <- cv.glmnet(X,Y, alpha=1,nfolds = 10,family="binomial")
+plot(cv.fit)
+abline(v=log(c(cv.fit$lambda.min, cv.fit$lambda.lse)), lty=2)
+```
+
+```{r}
+plot(cv.fit$glmnet.fit,xvar="lambda")
+abline(v=log(cv.fit$lambda.1se), lty=2,)
+```
+
+```{r}
+#如果取1倍标准误时,获取筛选后的特征
+lambda = cv.fit$lambda.1se
+Coefficients <- coef(fit, s = lambda)
+Active.Index <- which(Coefficients != 0)
+Active.Coefficients <- Coefficients[Active.Index]
+Active.Index
+Active.Coefficients
+row.names(Coefficients)[Active.Index]
+print("特征提取成功")
+```
+
+### 建立公式
+
+```{r}
+formulalse <-as.formula(label ~original_firstorder_Kurtosis+original_shape_Sphericity+original_glcm_JointAverage+wavelet.LHH_glcm_Imc2+wavelet.HLL_glcm_Idm+wavelet.HLL_glcm_InverseVariance+wavelet.LLL_firstorder_10Percentile+wavelet.LLL_gldm_GrayLevelNonUniformity)
+
+```
+
+### 逻辑回归
+
+```{r}
+model.Omics <- glm(formula=formulalse,data=tData_train,family=binomial(link="logit"))
+#查查看结果
+
+summary(model.Omics)
+```
+
+### 查看模型在单纯影像组学训练集的情况
+
+```{r}
+probOmicsTrain<-predict.glm(object =model.Omics,newdata=tData_train,type = "response")
+predOmicsTrain<-ifelse(probOmicsTrain>=0.5,1,0)
+error=predOmicsTrain-tData_train$label
+accuracy=(nrow(tData_train)-sum(abs(error)))/nrow(tData_train)
+
+precision=sum(tData_train$label & predOmicsTrain)/sum(predOmicsTrain)
+recall=sum(predOmicsTrain & tData_train$label)/sum(tData_train$label)
+F_measure=2*precision*recall/(precision+recall)    
+print(paste('准确率accuracy:',accuracy))
+print(paste('精确率precision:',precision))
+print(paste('召回率recall:',recall))
+print(paste('F_measure:',F_measure))
+
+table(tData_train$label,predOmicsTrain)
+```
+
+### 查看模型在单纯影像组学测试集的情况
+
+通过混淆矩阵，发现模型对Hgg和Lgg的预测能力也不错的。
+
+```{r}
+tData_test <- read.csv("csv/testOmics.csv",fileEncoding = "UTF-8-BOM")
+
+probOmicsTest<-predict.glm(object =model.Omics,newdata=tData_test,type = "response")
+predOmicsTest<-ifelse(probOmicsTest>=0.5,1,0)
+error=predOmicsTest-tData_test$label
+accuracy=(nrow(tData_test)-sum(abs(error)))/nrow(tData_test)
+
+precision=sum(tData_test$label & predOmicsTest)/sum(predOmicsTest)
+recall=sum(predOmicsTest & tData_test$label)/sum(tData_test$label)
+F_measure=2*precision*recall/(precision+recall)    
+print(paste('准确率accuracy:',accuracy))
+print(paste('精确率precision:',precision))
+print(paste('召回率recall:',recall))
+print(paste('F_measure:',F_measure))
+
+table(tData_test$label,predOmicsTest)
+```
+
+
+## 绘制ROC
+
+### 绘制训练集ROC
+
+通过绘制单纯临床，单纯影像组学，临床+影像组学的ROC曲线
+
+```{r}
+rocOmics <- roc(tData_train$label, probOmicsTrain)
+rocOmics
+```
+
+```{r}
+# 先绘制1条ROC曲线
+plot(rocOmics, 
+     print.auc=TRUE, # 图像上输出AUC的值
+     print.auc.x=0.4, print.auc.y=0.6, # 设置AUC值坐标为（x，y）
+     auc.polygon=TRUE, # 将ROC曲线下面积转化为多边形
+     auc.polygon.col="#fff7f7",  # 设置ROC曲线下填充色
+     grid=FALSE,
+     print.thres=FALSE, # 图像上输出最佳截断值
+     main=" Train ROC curves",  # 添加图形标题
+     col="red",    # 设置ROC曲线颜色
+     legacy.axes=TRUE,# 使x轴从0到1，表示为1-特异度
+     xlim=c(1,0),
+     mgp=c(1.5, 1, 0),
+     lty=3)
+
+
+# 添加图例
+legend(0.45, 0.30,  # 图例位置x，y
+       bty = "n",   # 图例样式
+       legend=c("Radiomics signature"),  # 添加分组
+       col=c("red","green","blue"),  # 颜色跟前面一致
+       lwd=1,
+       lty=c(3,2,1))  # 线条粗细
+```
+
+### 绘制测试集集ROC
+
+```{r}
+rocOmicsTest <- roc(tData_test$label, probOmicsTest)
+rocOmicsTest
+```
+
+```{r}
+plot(rocOmicsTest, 
+     print.auc=TRUE, # 图像上输出AUC的值
+     print.auc.x=0.4, print.auc.y=0.6, # 设置AUC值坐标为（x，y）
+     auc.polygon=TRUE, # 将ROC曲线下面积转化为多边形
+     auc.polygon.col="#fff7f7",  # 设置ROC曲线下填充色
+     grid=FALSE,
+     print.thres=FALSE, # 图像上输出最佳截断值
+     main=" Test ROC curves",  # 添加图形标题
+     col="red",    # 设置ROC曲线颜色
+     legacy.axes=TRUE,# 使x轴从0到1，表示为1-特异度
+     xlim=c(1,0),
+     mgp=c(1.5, 1, 0),
+     lty=3)   
+
+
+# 添加图例
+legend(0.45, 0.30,  # 图例位置x，y
+       bty = "n",   # 图例样式
+       legend=c("Radiomics signature"),  # 添加分组
+       col=c("red","green","blue"),  # 颜色跟前面一致
+       lwd=1,
+       lty=c(3,2,1))  # 线条粗细
+
+print("finish")
+```
+
+### 结束
+
